@@ -1,0 +1,539 @@
+---
+title: 'Converted Notebook'
+output: html_document
+---
+
+```{r}
+#from google.colab import drive
+#drive.mount('/content/drive')
+```
+
+# Lectura datasets
+
+Vamos a analizar el comportamiento del algoritmo DANN respecto a sus hiperparametros, para predecir el aumento de una acción. En este caso, son las de Galicia, YPF y pampa energía.
+
+```{r}
+#CAMBIAR A R
+library(data.table)
+
+#ruta <- "/content/drive/MyDrive/EEA/dataset"
+ruta <-'G:/.shortcut-targets-by-id/1kW9PMD29uXKTfSNf1uj6E11vsnWOAD72/EEA/dataset'
+
+galicia <- fread(paste0(ruta, "/Datos históricos de GP Fin Galicia (GGALm) 01-19 a 06-25.csv"))
+ypf     <- fread(paste0(ruta, "/Datos históricos de YPF (YPFDm).csv"))
+pampa  <- fread(paste0(ruta, "/Datos históricos de Pampa Energía (PAMPm).csv"))
+
+```
+
+```{r}
+#Función para agregar id en los dataset
+add_id_column <- function(data_list, id_names) {
+  if (length(data_list) != length(id_names)) {
+    stop("Error: La lista de datasets y la lista de nombres (id_names) deben tener la misma longitud.")
+  }
+
+  for (i in seq_along(data_list)) {
+    data_list[[i]][, id := id_names[i]]
+
+    setcolorder(data_list[[i]], "id")
+  }
+
+  return(data_list)
+}
+```
+
+```{r}
+# 1. Crear la lista de datasets (la entrada a la función)
+data_list <- list(galicia, ypf, pampa)
+
+# 2. Crear la lista de nombres de identificación (el nuevo contenido de la columna 'id')
+id_names <- c("Galicia", "YPF", "Pampa")
+add_id_column(data_list, id_names)
+
+# Unificamos los dataset
+dataset <- rbindlist(data_list)
+
+head(dataset)
+str(dataset)
+```
+
+# Preprocesamiento
+
+```{r}
+dataset[, Fecha := as.Date(Fecha, format = "%d.%m.%Y")]
+cols_precio <- c("Último", "Apertura", "Máximo", "Mínimo")
+
+dataset[, (cols_precio) := lapply(.SD, function(x) {
+  # 1. Eliminar el punto (separador de miles)
+  x <- gsub("\\.", "", x)
+  # 2. Reemplazar la coma (separador decimal) por punto
+  x <- gsub(",", "\\.", x)
+  # 3. Convertir a numérico
+  as.numeric(x)
+}), .SDcols = cols_precio]
+
+
+convertir_volumen_vectorizada <- function(x) {
+  # 1. Limpieza preliminar: Reemplazar la coma decimal por punto.
+  # (Esto debe hacerse en todo el vector 'x' a la vez)
+  clean_val <- gsub(",", ".", x)
+
+  # 2. Aplicar la lógica de K y M usando ifelse anidado (vectorizado)
+  resultado <- ifelse(
+    # CASO M: Identifica elementos que contienen 'M'
+    grepl("M", clean_val),
+    # Acción M: Elimina 'M' y multiplica por 1,000,000
+    as.numeric(gsub("M", "", clean_val)) * 1000000,
+
+    # Resto de los casos: Anidamos la prueba de 'K'
+    ifelse(
+      # CASO K: Identifica elementos que contienen 'K'
+      grepl("K", clean_val),
+      # Acción K: Elimina 'K' y multiplica por 1,000
+      as.numeric(gsub("K", "", clean_val)) * 1000,
+      # CASO Base: Si no es K ni M, solo convierte a numérico
+      as.numeric(clean_val)
+    )
+  )
+  return(resultado)
+}
+
+# Aplicar la función vectorizada a la columna 'Vol.'
+dataset[, `Vol.` := convertir_volumen_vectorizada(`Vol.`)]
+dataset[, `% var.` := as.numeric(gsub("%", "", gsub(",", ".", `% var.`))) / 100]
+# Opcional: renombrar a 'Variacion_Retorno' para mejor manejo
+setnames(dataset, "% var.", "Var")
+setnames(dataset, "Vol.", "Vol")
+```
+
+```{r}
+#dataset[, id_factor := as.integer(factor(id))]
+```
+
+```{r}
+dataset[, table(id, year(Fecha))]
+```
+
+# Ajuste por UVA
+
+Aqui entendemos que una forma de unificar las escalas, debido la inflación, es utilizar un índice como UVA, que ademas tiene la cotización diaria.
+
+```{r}
+#Traigo las cotizaciones historicas
+#ruta <- "/content/drive/MyDrive/EEA"
+ruta <-'G:/.shortcut-targets-by-id/1kW9PMD29uXKTfSNf1uj6E11vsnWOAD72/EEA'
+
+uva <- fread(paste0(ruta, "/cotizacionesUVA.csv"))
+uva[, Fecha := as.Date(fecha, format = "%d/%m/%Y")]
+setcolorder(uva, c("fecha","Fecha")) ## poner las dos primeras columnas
+```
+
+```{r}
+dataset <- merge( dataset,
+  uva[, c("Fecha", "uva")],
+  by = "Fecha",
+  all.x = TRUE
+)
+```
+
+```{r}
+cols <- c('Último','Apertura', 'Máximo', 'Mínimo')
+dataset[, (cols) := lapply(.SD, function(x) x / uva), .SDcols = cols]
+dataset[, ('uva'):=NULL]
+dataset[, ('Vol'):=NULL]
+```
+
+# Ingenieria atributos
+
+## Lags e historicos
+
+```{r}
+# todo es lagueable, menos la primary key y la clase
+cols_id <- grep('id', colnames(dataset), value = TRUE)
+
+cols_lagueables <- setdiff(
+  colnames(dataset),
+  c(cols_id, 'Fecha')
+)
+
+# https://rdrr.io/cran/data.table/man/shift.html
+
+# lags de orden 1
+dataset[,
+  paste0(cols_lagueables, "_lag1") := shift(.SD, 1, NA, "lag"),
+  by= id,
+  .SDcols= cols_lagueables
+]
+
+
+# lags de orden 5
+dataset[,
+  paste0(cols_lagueables, "_lag5") := shift(.SD, 5, NA, "lag"),
+  by= id,
+  .SDcols= cols_lagueables
+]
+
+# lags de orden 15
+dataset[,
+  paste0(cols_lagueables, "_lag15") := shift(.SD, 15, NA, "lag"),
+  by= id,
+  .SDcols= cols_lagueables
+]
+
+# lags de orden 30
+dataset[,
+  paste0(cols_lagueables, "_lag30") := shift(.SD, 30, NA, "lag"),
+  by= id,
+  .SDcols= cols_lagueables
+]
+
+# agrego los delta lags
+for (vcol in cols_lagueables)
+{
+  dataset[, paste0(vcol, "_delta1") := get(vcol) - get(paste0(vcol, "_lag1"))]
+  dataset[, paste0(vcol, "_delta5") := get(vcol) - get(paste0(vcol, "_lag5"))]
+  dataset[, paste0(vcol, "_delta15") := get(vcol) - get(paste0(vcol, "_lag15"))]
+  dataset[, paste0(vcol, "_delta30") := get(vcol) - get(paste0(vcol, "_lag30"))]
+  }
+
+```
+
+```{r}
+dataset <- dataset[order(id, Fecha)]
+
+cols_precio <- c("Último", "Apertura", "Máximo", "Mínimo")
+window <- 6
+
+# 1. Calcular la media móvil centrada (3 atrás, 3 adelante)
+dataset[, paste0(cols_precio, "_MM_C", window) :=
+          lapply(.SD, function(x) frollmean(x, n = window, align = "center")),
+        .SDcols = cols_precio,
+        # Agrupar por 'id' es CRUCIAL para que el cálculo no mezcle acciones
+        by = id]
+```
+
+```{r}
+#para evitar los nulos, si usamos lags, filtrar el dataset a partir del día que comienzan esos nulos.
+lags_col <- grep('Último', colnames(dataset), value = TRUE)
+
+dataset[, .(Fecha, id, .SD), .SDcols=lags_col]
+```
+
+# Modelado
+
+## Dann
+
+<https://github.com/P115C/dann>
+
+### Funciones
+
+```{r}
+cargar <- function(pkg){
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+cargar("dann")
+cargar("dplyr")
+cargar("ggplot2")
+cargar("MASS")
+cargar("Metrics")
+cargar("class")
+cargar("data.table")
+cargar("mlbench")
+cargar("extraDistr")
+
+```
+
+```{r}
+estandarizar <- function(dt_entr, dt_prueb){
+  cols = setdiff(colnames(dt_entr), c("Y"))
+  x = dt_entr[cols]
+
+  dt_entr_m <- data.frame(as.list(x %>% apply(2, mean)))
+  dt_entr_sd <- data.frame(as.list(x %>% apply(2, sd)))
+
+  for (c in cols){
+    dt_entr[,c] <- (dt_entr[,c] - dt_entr_m[,c]) / dt_entr_sd[,c]
+    dt_prueb[,c] <-  (dt_prueb[,c] - dt_entr_m[,c]) / dt_entr_sd[,c]
+  }
+
+  return (list(dt_entr, dt_prueb))
+}
+
+correr_modelos <- function(dt_entr, dt_prueb, sdann_dim, k=5, neighborhood_size=50,
+                           con_estandarizar=TRUE, epsilon = 1)
+{
+  if (con_estandarizar) {
+    r = estandarizar(dt_entr, dt_prueb)
+    dt_entr = r[[1]]
+    dt_prueb = r[[2]]
+  }
+
+  modelos = c()
+  accs = c()
+
+  m_dann <- dann(formula = Y ~ ., data = dt_entr, k = k, neighborhood_size = neighborhood_size, epsilon = epsilon)
+  ej1_prueb_pred <- predict(object = m_dann, new_data = dt_prueb, type = "class")$.pred_class
+  ej1_prueb_real <- dt_prueb$Y
+  acc = accuracy(ej1_prueb_pred, ej1_prueb_real)
+  modelos = c(modelos, "dann")
+  accs = c(accs, acc)
+
+  m_sdann <- sub_dann(formula = Y ~ ., data = dt_entr, k = k,
+                    neighborhood_size = neighborhood_size, epsilon = epsilon, weighted = FALSE,
+                    sphere = "classical", numDim = sdann_dim) # mcd
+  ej1_prueb_pred <- predict(object = m_sdann, new_data = dt_prueb, type = "class")$.pred_class
+  ej1_prueb_real <- dt_prueb$Y
+  acc = accuracy(ej1_prueb_pred, ej1_prueb_real)
+  modelos = c(modelos, "sub_dann")
+  accs = c(accs, acc)
+
+  m_lda <- lda(Y ~., data = dt_entr)
+  ej1_prueb_pred <- predict(m_lda, dt_prueb)$class
+  ej1_prueb_real <- dt_prueb$Y
+  acc = accuracy(ej1_prueb_pred, ej1_prueb_real)
+  modelos = c(modelos, "lda")
+  accs = c(accs, acc)
+
+  cols = setdiff(colnames(dt_entr), c("Y"))
+  ej1_prueb_pred <- knn(dt_entr[cols], dt_prueb[cols], cl=dt_entr$Y, k = k)
+  ej1_prueb_real <- dt_prueb$Y
+  acc = accuracy(ej1_prueb_pred, ej1_prueb_real)
+  modelos = c(modelos, "knn")
+  accs = c(accs, acc)
+
+  res = data.table(modelo=modelos, accuracy=accs)
+  return (res)
+}
+
+```
+
+### Target
+
+```{r}
+# Aumento de la acción Galicia
+dataset <-dataset[complete.cases(dataset)]
+dataset <-dataset[complete.cases(dataset)]
+
+dataset[, Variacion:=Último/Último_lag1 - 1]
+dataset[, Target:=ifelse(Variacion>0, 1, 0)]
+dataset[, table(id, Target)]
+```
+
+### Entrenamiento
+
+Definimos como filtro los años 2023 y 2024 para entrenar, y 2025 para realizar el test.
+
+```{r}
+dataset[, table(year(Fecha))]
+```
+
+```{r}
+str(dataset)
+```
+
+```{r}
+#install.packages('caret')
+library(caret)
+accion <- 'Galicia'
+
+dt_train <- dataset[year(Fecha) >= 2023 & year(Fecha) <= 2024 & id == accion]
+dt_test  <- dataset[year(Fecha) == 2025 & id==accion]
+
+#------------------------------------------------
+# 2) Definir variables explicativas y target
+#------------------------------------------------
+
+# Target como factor (necesario para clasificación)
+dt_train[, Target := factor(Target, levels = c("0", "1"))]
+niv <- levels(dt_train$Target)
+dt_test[, Target := factor(Target, levels = niv)]
+
+# Selecciono columnas numéricas para el modelo
+# (Excluyo Fecha y otras que no correspondan)
+cols_modelo <- setdiff(colnames(dataset), c("Fecha",'id', "Target"))
+X_train <- as.matrix(dt_train[, ..cols_modelo])
+y_train <- dt_train$Target
+
+X_test <- as.matrix(dt_test[, ..cols_modelo])
+y_test <- dt_test$Target
+```
+
+## Espacio de búsqueda de hiperparametros
+
+Buscamos interacciones entre los tres hiperparametros del DANN, seteamos una semilla para garantizar la reproducibilidad pero no hemos notado cambios en los resultados si es otra. En teoría, por el size neighboords puede alterar la semilla, pero no se ha visto eso.
+
+```{r}
+#------------------------------------------------
+# Grid de hiperparámetros
+#------------------------------------------------
+Sys.time()
+ks <- c(5, 10, 20, 30,40,50,80,100,150)
+neighs <- c(50, 100, 200)
+eps <- c(0.1, 1 , 5, 10)
+
+# Tabla para guardar resultados
+resultados <- data.table()
+
+# Niveles del target
+niv <- levels(dt_train$Target)
+
+set.seed(202021)
+#------------------------------------------------
+# BUCLE
+#------------------------------------------------
+for (k_val in ks) {
+  for (n_val in neighs) {
+    for (e in eps) {
+
+      # ==========================
+      # Entrenar modelo
+      # ==========================
+      modelo <- dann(
+        x = X_train,
+        y = y_train,
+        k = k_val,
+        neighborhood_size = n_val,
+        epsilon = e
+      )
+
+      # ==========================
+      # MÉTRICAS TRAIN
+      # ==========================
+      pred_raw_train <- predict(modelo, X_train)$.pred_class
+
+      pred_train <- factor(as.character(pred_raw_train), levels = niv)
+      y_train_fac <- factor(as.character(y_train), levels = niv)
+
+      cm_train <- confusionMatrix(pred_train, y_train_fac, positive = "1")
+
+      acc_train   <- cm_train$overall["Accuracy"]
+      kappa_train <- cm_train$overall["Kappa"]
+
+      sens_train <- cm_train$byClass["Sensitivity"]
+      spec_train <- cm_train$byClass["Specificity"]
+      prec_train <- cm_train$byClass["Precision"]
+      f1_train   <- cm_train$byClass["F1"]
+
+      # ==========================
+      # MÉTRICAS TEST
+      # ==========================
+      pred_raw_test <- predict(modelo, X_test)$.pred_class
+
+      pred_test <- factor(as.character(pred_raw_test), levels = niv)
+      y_test_fac <- factor(as.character(y_test), levels = niv)
+
+      cm_test <- confusionMatrix(pred_test, y_test_fac, positive = "1")
+
+      acc_test   <- cm_test$overall["Accuracy"]
+      kappa_test <- cm_test$overall["Kappa"]
+
+      sens_test <- cm_test$byClass["Sensitivity"]
+      spec_test <- cm_test$byClass["Specificity"]
+      prec_test <- cm_test$byClass["Precision"]
+      f1_test   <- cm_test$byClass["F1"]
+
+      # ==========================
+      # Guardar fila en resultados
+      # ==========================
+      resultados <- rbind(
+        resultados,
+        data.table(
+          k = k_val,
+          neighborhood_size = n_val,
+          epsilon = e,
+
+          # TEST
+          Test_Accuracy = acc_test,
+          Test_Kappa = kappa_test,
+          Test_Sensitivity = sens_test,
+          Test_Specificity = spec_test,
+          Test_Precision = prec_test,
+          Test_F1 = f1_test,
+
+          # TRAIN
+          Train_Accuracy = acc_train,
+          Train_Kappa = kappa_train,
+          Train_Sensitivity = sens_train,
+          Train_Specificity = spec_train,
+          Train_Precision = prec_train,
+          Train_F1 = f1_train
+        )
+      )
+
+    } 
+  }   
+}     
+
+```
+
+```{r}
+Sys.time()
+fwrite(resultados, paste0(ruta, '/resultados_variacion_0',accion,'_2023a2024_1422025.csv'))
+```
+
+## Curvas de complejidad
+
+Utilizaremos la precisión porque entendemos que queremos optimizar que en base a saber que la acción aumnta, que DANN prediga que aumenta.
+
+$$
+Precision = \frac{VP}{VP + FP}
+$$
+
+Los resultados muestran que el epsilon no estaría gravitando mucho, y que estableciendo un k de 20, y un size_neighboord de 50 o 100, se cruzan las curvas de train y test, donde habría algún óptimo.
+
+```{r}
+#cargamos resultados por acción
+
+galicia_resultados <- fread(paste0(ruta, '/resultados_variacion_0Galicia_2023a2024_1422025.csv'))
+ypf_resultados <- fread(paste0(ruta, '/resultados_variacion_0YPF_2023a2024_1422025.csv'))
+pampa_resultados <- fread(paste0(ruta, '/resultados_variacion_0Pampa_2023a2024_1422025.csv'))
+
+galicia_resultados$accion <-'Galicia'
+ypf_resultados$accion <-'YPF'
+pampa_resultados$accion <-'Pampa'
+
+resultados <- rbindlist(
+  list(galicia_resultados, ypf_resultados, pampa_resultados),
+  use.names = TRUE,
+  fill = TRUE
+)
+```
+
+```{r}
+#menor sobreajuste aumentando el K y le neighboord_size..?
+
+medida <-'Precision'
+
+result_long <- melt(
+  resultados,
+  id.vars = c("k", "neighborhood_size",'epsilon','accion'),
+  measure.vars = c(paste0('Test_',medida), paste0("Train_",medida)),   # <-- las métricas que quieras graficar
+  variable.name = "Metrica",
+  value.name = "Valor"
+)
+
+ggplot(result_long, aes(y=Valor, x=k, color=Metrica))+
+  geom_line()+
+  facet_grid(accion~neighborhood_size)+
+  scale_x_continuous(breaks = seq(0, 150, by = 25))
+```
+
+```{r}
+result_long[Metrica=='Test_Precision', .SD][order(-Valor)]
+```
+
+### Usando el epsilon
+
+
+```{r}
+
+ggplot(result_long, aes(y=Valor, x=k, color=Metrica))+
+  geom_line()+
+  facet_grid(accion~epsilon)+
+  scale_x_continuous(breaks = seq(0, 150, by = 25))
+```
+
