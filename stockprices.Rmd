@@ -1,0 +1,940 @@
+---
+title: "knn_vs_dann_stock_prices"
+author: "Pablo Bianchi, Matías Calma"
+date: "2025-12-14"
+output: 
+  html_document:
+    theme: cosmo       
+    highlight: tango   
+    toc: true           
+    toc_float: true    
+---
+
+# Comparación de kNN y DANN en el dataset de Stock Prices
+
+```{r include=FALSE}
+library(data.table)
+library(caret)
+library(lubridate)
+```
+
+## Cargamos los datasets
+
+```{r}
+galicia <- fread("dataset/Datos históricos de GP Fin Galicia (GGALm) 01-19 a 06-25.csv")
+ypf <- fread("dataset/Datos históricos de YPF (YPFDm).csv")
+pampa <- fread("dataset/Datos históricos de Pampa Energía (PAMPm).csv")
+agrometal <- fread("dataset/Datos históricos de Agrometal (AGROm).csv")
+morixe <- fread("dataset/Datos históricos de Morixe Hermanos (MORIm).csv")
+ternium <- fread("dataset/Datos históricos de Ternium Argentina (TXARm).csv")
+loma <- fread("dataset/Datos históricos de Loma Negra (LOMAm).csv")
+aluar <- fread("dataset/Datos históricos de Aluar (ALUAm).csv")
+byma <- fread("dataset/Datos históricos de BYMA (BYMAm).csv")
+cepu <- fread("dataset/Datos históricos de Central Puerto (CEPUm).csv")
+come <- fread("dataset/Datos históricos de Comercial del Plata (COMEm).csv")
+supv <- fread("dataset/Datos históricos de Grupo Supervielle (SUPVm).csv")
+irsa <- fread("dataset/Datos históricos de IRSA (IRSAm).csv")
+tran <- fread("dataset/Datos históricos de Transener (TRANm).csv")
+tgno <- fread("dataset/Datos históricos de Trans. Gas Norte (TGNO4m).csv")
+```
+
+```{r}
+add_id_column <- function(data_list, id_names) {
+  if (length(data_list) != length(id_names)) {
+    stop("Error: La lista de datasets y la lista de nombres (id_names) deben tener la misma longitud.")
+  }
+
+  for (i in seq_along(data_list)) {
+    data_list[[i]][, id := id_names[i]]
+
+    setcolorder(data_list[[i]], "id")
+  }
+
+  return(data_list)
+}
+```
+
+Agregamos el nombre y unificamos los datasets.
+
+```{r include=FALSE}
+data_list <- list(galicia, ypf, pampa, agrometal, morixe, ternium, loma, aluar, byma, cepu, come, supv, irsa, tran, tgno)
+
+id_names <- c("Galicia", "YPF", "Pampa Energía", "Agrometal", "Morixe", "Ternium", "Loma Negra", "Aluar", "BYMA", "CEPU", "COME", "SUPV", "IRSA", "TRAN", "TGN0")
+
+add_id_column(data_list, id_names)
+```
+
+```{r}
+# Unificamos los dataset
+dataset <- rbindlist(data_list)
+
+head(dataset)
+str(dataset)
+```
+
+### Limpieza del dataset
+
+```{r warning=FALSE}
+# Corregimos el formato de la fecha
+dataset[, Fecha := as.Date(Fecha, format = "%d.%m.%Y")]
+
+# Corregimos variables numéricas
+cols_precio <- c("Último", "Apertura", "Máximo", "Mínimo")
+
+dataset[, (cols_precio) := lapply(.SD, function(x) {
+  # 1. Eliminar el punto (separador de miles)
+  x <- gsub("\\.", "", x)
+  # 2. Reemplazar la coma (separador decimal) por punto
+  x <- gsub(",", "\\.", x)
+  # 3. Convertir a numérico
+  as.numeric(x)
+}), .SDcols = cols_precio]
+
+
+# Corregimos la variable Vol. con la función
+convertir_volumen_vectorizada <- function(x) {
+  # 1. Limpieza preliminar: Reemplazar la coma decimal por punto.
+  # (Esto debe hacerse en todo el vector 'x' a la vez)
+  clean_val <- gsub(",", ".", x)
+
+  # 2. Aplicar la lógica de K y M usando ifelse anidado (vectorizado)
+  resultado <- ifelse(
+    # CASO M: Identifica elementos que contienen 'M'
+    grepl("M", clean_val),
+    # Acción M: Elimina 'M' y multiplica por 1,000,000
+    as.numeric(gsub("M", "", clean_val)) * 1000000,
+
+    # Resto de los casos: Anidamos la prueba de 'K'
+    ifelse(
+      # CASO K: Identifica elementos que contienen 'K'
+      grepl("K", clean_val),
+      # Acción K: Elimina 'K' y multiplica por 1,000
+      as.numeric(gsub("K", "", clean_val)) * 1000,
+      # CASO Base: Si no es K ni M, solo convierte a numérico
+      as.numeric(clean_val)
+    )
+  )
+  return(resultado)
+}
+# Aplicar la función vectorizada a la columna 'Vol.'
+dataset[, `Vol.` := convertir_volumen_vectorizada(`Vol.`)]
+
+
+# Corregimos la '% var."
+dataset[, `% var.` := as.numeric(gsub("%", "", gsub(",", ".", `% var.`))) / 100]
+
+# Renombrar a 'Variacion_Retorno' para mejor manejo
+setnames(dataset, "% var.", "Var")
+```
+
+```{r}
+dataset
+```
+
+## Feature Engineering
+
+```{r}
+# Ordenamos el dataset
+dataset <- dataset[order(id, Fecha)]
+dataset
+```
+
+### Eliminación de variables
+
+```{r}
+dataset[, "Vol." := NULL]
+```
+
+### Ajuste por UVA
+
+
+```{r}
+uva <- fread("dataset/cotizacionesUVA.csv")
+uva[, Fecha := as.Date(fecha, format = "%d/%m/%Y")]
+setcolorder(uva, c("fecha","Fecha")) ## poner las dos primeras columnas
+
+dataset <- merge( dataset,
+  uva[, c("Fecha", "uva")],
+  by = "Fecha",
+  all.x = TRUE
+)
+
+cols <- c('Último','Apertura', 'Máximo', 'Mínimo')
+dataset[, (cols) := lapply(.SD, function(x) x / uva), .SDcols = cols]
+dataset[, ('uva'):=NULL]
+```
+
+### Calculamos la media móvil
+
+```{r}
+#Calculamos la media móvil con una ventana de 6 días
+cols_precio <- c("Último", "Apertura", "Máximo", "Mínimo")
+window <- 6
+
+# Calcular la media móvil centrada (3 atrás, 3 adelante)
+dataset[, paste0(cols_precio, "_MM_C", window) :=
+          lapply(.SD, function(x) frollmean(x, n = window, align = "center")),
+        .SDcols = cols_precio,
+        by = id]
+```
+
+### Creamos lags y delta lags
+
+```{r}
+N_LAGS <- 5
+lags_to_create <- 1:N_LAGS
+
+cols_to_lag <- names(dataset)[sapply(dataset, is.numeric) & 
+                              !grepl("_MM_C", names(dataset)) & 
+                              names(dataset) != "Fecha"]
+
+# Crear todos los nombres de columnas de una vez
+lag_names <- unlist(lapply(cols_to_lag, function(col) {
+  paste0(col, "_L", lags_to_create)
+}))
+
+delta_names <- unlist(lapply(cols_to_lag, function(col) {
+  paste0(col, "_DL", lags_to_create)
+}))
+
+# Crear lags y deltas
+dataset[, c(lag_names, delta_names) := {
+  # Crear lista de lags para todas las columnas
+  all_lags <- lapply(cols_to_lag, function(col) {
+    lapply(lags_to_create, function(l) {
+      shift(get(col), n = l, type = "lag")
+    })
+  })
+  all_lags <- unlist(all_lags, recursive = FALSE)
+  
+  # Crear lista de deltas
+  all_deltas <- lapply(seq_along(cols_to_lag), function(i) {
+    col <- cols_to_lag[i]
+    lapply(lags_to_create, function(l) {
+      get(col) - shift(get(col), n = l, type = "lag")
+    })
+  })
+  all_deltas <- unlist(all_deltas, recursive = FALSE)
+  
+  # Combinar lags y deltas
+  c(all_lags, all_deltas)
+}, by = id]
+```
+
+Las dimensiones del dataset son:
+```{r echo=FALSE}
+dim(dataset)
+```
+
+
+# Modelado
+
+## Variable Objetivo
+
+```{r}
+# Definir la variable objetivo (Target)
+dataset[, Target := shift(Último, n = 1, type = "lead"), by = id]
+
+# Calcular el Retorno Futuro: (Precio de mañana - Precio de hoy) / Precio de hoy
+dataset[, Retorno_Futuro := (Target - Último) / Último]
+
+# Crear la variable de Clasificación (Clase 1 o 0)
+UMBRAL_ALZA <- 0.01
+dataset[, Clase := ifelse(Retorno_Futuro > UMBRAL_ALZA, 1, 0)]
+
+dataset[, c("Target", "Retorno_Futuro") := NULL]
+```
+
+```{r}
+# Eliminar filas con NA en la variable objetivo (Clase)
+dataset <- dataset[!is.na(Clase)]
+
+# Eliminar cualquier fila con NA en los predictores (lags, MM)
+dataset <- na.omit(dataset)
+```
+
+```{r include=FALSE}
+dataset
+```
+
+## Estandarización de las variables
+
+```{r}
+# Crear una lista con TODAS las columnas que serán predictoras (X)
+columnas_X <- names(dataset)[!names(dataset) %in% c("id", "Fecha", "Clase")]
+
+# Aplicar la estandarización Z-Score:
+# Se aplica la función de estandarización A CADA COLUMNA,
+# GRUPO POR GRUPO (por cada 'id').
+dataset[, (columnas_X) := lapply(.SD, function(x) {
+    (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}), 
+.SDcols = columnas_X,
+by = id]
+```
+
+```{r include=FALSE}
+dataset
+```
+
+```{r}
+str(dataset)
+```
+
+### Proporción de clase
+
+```{r}
+# Contar la cantidad de filas (N) para cada valor único en la columna 'Clase'
+conteo_clases <- dataset[, .N, by = Clase]
+
+# Mostrar el resultado
+print(conteo_clases)
+```
+
+## Preparación del modelo
+
+### Configuración
+
+```{r}
+# Seleccionar acciones a modelar
+ACCIONES_A_MODELAR <- unique(dataset$id)
+
+# Filtro: solo acciones con suficientes observaciones
+MIN_OBSERVACIONES <- 200
+
+# Período de entrenamiento INICIAL
+FECHA_INICIO_TRAIN <- as.Date("2022-01-01")
+FECHA_FIN_TRAIN <- as.Date("2024-12-31")
+
+# ROLLING TEST: configuración
+FECHA_INICIO_TEST <- as.Date("2025-01-01")
+N_DIAS_TEST <- 115
+REENTRENAR_CADA_DIA <- TRUE
+
+# Walk-Forward Validation
+N_WINDOWS <- 3
+MIN_TRAIN_MONTHS <- 6
+
+# Hiperparámetros
+K_VALUES <- c(3, 5, 7, 9, 12, 15, 20)
+EPSILON_VALUES <- c(0.001, 0.005, 0.01, 0.1, 0.3, 0.5, 0.7, 1.0)
+K_LOCAL_VALUES <- c(50, 75, 100, 110, 120, 175, 200, 220, 250, 300)
+
+
+# DOWNSAMPLING (balanceo de clases)
+APLICAR_DOWNSAMPLING <- FALSE  # TRUE: aplica downsampling | FALSE: datos desbalanceados
+N_SEMILLAS <- 5  # Solo se usan si APLICAR_DOWNSAMPLING = TRUE
+SEMILLAS <- c(42, 123, 456, 789, 2024)
+
+# MÉTRICA DE OPTIMIZACIÓN
+# Opciones: "F1", "Accuracy", "Recall", "Precision"
+METRICA_OPTIMIZACION <- "Precision"
+
+# Output
+SAVE_RESULTS <- TRUE
+OUTPUT_DIR <- "models_por_accion"
+```
+
+### Funciones necesarias para DANN
+
+```{r}
+compute_between_scatter <- function(X, y) {
+  classes <- unique(y)
+  n <- nrow(X)
+  p <- ncol(X)
+  overall_mean <- colMeans(X)
+  
+  B <- matrix(0, p, p)
+  for (class in classes) {
+    X_class <- X[y == class, , drop = FALSE]
+    n_class <- nrow(X_class)
+    class_mean <- colMeans(X_class)
+    diff <- class_mean - overall_mean
+    B <- B + (n_class / n) * outer(diff, diff)
+  }
+  return(B)
+}
+
+compute_within_scatter <- function(X, y) {
+  classes <- unique(y)
+  n <- nrow(X)
+  p <- ncol(X)
+  
+  W <- matrix(0, p, p)
+  for (class in classes) {
+    X_class <- X[y == class, , drop = FALSE]
+    n_class <- nrow(X_class)
+    class_mean <- colMeans(X_class)
+    
+    for (i in 1:n_class) {
+      diff <- X_class[i, ] - class_mean
+      W <- W + (1 / n) * outer(diff, diff)
+    }
+  }
+  return(W)
+}
+
+dann_classify <- function(X_train, y_train, X_test, k = 5, epsilon = 1, 
+                          k_local = 50, verbose = FALSE) {
+  n_train <- nrow(X_train)
+  n_test <- nrow(X_test)
+  p <- ncol(X_train)
+  
+  means <- colMeans(X_train)
+  sds <- apply(X_train, 2, sd)
+  sds[sds == 0] <- 1
+  
+  X_train_scaled <- scale(X_train, center = means, scale = sds)
+  X_test_scaled <- scale(X_test, center = means, scale = sds)
+  
+  B <- compute_between_scatter(X_train_scaled, y_train)
+  W <- compute_within_scatter(X_train_scaled, y_train)
+  W_reg <- W + epsilon * diag(p)
+  
+  W_inv <- tryCatch({
+    solve(W_reg)
+  }, error = function(e) {
+    diag(1, p)
+  })
+  
+  predictions <- vector("character", n_test)
+  probabilities <- matrix(0, n_test, length(unique(y_train)))
+  colnames(probabilities) <- sort(unique(y_train))
+  
+  for (i in 1:n_test) {
+    x_test <- X_test_scaled[i, ]
+    
+    distances_euclidean <- sqrt(rowSums((sweep(X_train_scaled, 2, x_test))^2))
+    k_local_used <- min(k_local, n_train)
+    k_nearest_idx <- order(distances_euclidean)[1:k_local_used]
+    
+    X_local <- X_train_scaled[k_nearest_idx, , drop = FALSE]
+    y_local <- y_train[k_nearest_idx]
+    
+    if (length(unique(y_local)) > 1 && k_local_used > p) {
+      W_local <- compute_within_scatter(X_local, y_local)
+      W_local_reg <- W_local + epsilon * diag(p)
+      
+      metric_matrix <- tryCatch({
+        solve(W_local_reg) + epsilon * B
+      }, error = function(e) {
+        W_inv + epsilon * B
+      })
+    } else {
+      metric_matrix <- W_inv + epsilon * B
+    }
+    
+    distances_adapted <- numeric(k_local_used)
+    for (j in 1:k_local_used) {
+      diff <- X_train_scaled[k_nearest_idx[j], ] - x_test
+      distances_adapted[j] <- tryCatch({
+        sqrt(max(0, as.numeric(t(diff) %*% metric_matrix %*% diff)))
+      }, error = function(e) {
+        distances_euclidean[k_nearest_idx[j]]
+      })
+    }
+    
+    final_k_idx <- k_nearest_idx[order(distances_adapted)[1:min(k, k_local_used)]]
+    k_neighbors_classes <- y_train[final_k_idx]
+    
+    vote_table <- table(k_neighbors_classes)
+    predictions[i] <- names(which.max(vote_table))
+    
+    for (class in names(vote_table)) {
+      probabilities[i, class] <- vote_table[class] / length(k_neighbors_classes)
+    }
+  }
+  
+  return(list(
+    class = factor(predictions, levels = levels(y_train)),
+    prob = probabilities
+  ))
+}
+```
+
+### Función para extraer métrica
+
+```{r}
+extraer_metrica <- function(cm, metrica = "F1") {
+  valor <- switch(metrica,
+    "F1" = cm$byClass["F1"],
+    "Accuracy" = cm$overall["Accuracy"],
+    "Recall" = cm$byClass["Recall"],
+    "Precision" = cm$byClass["Precision"],
+    cm$byClass["F1"]  # Default
+  )
+  
+  if (is.na(valor)) return(0)
+  return(as.numeric(valor))
+}
+```
+
+## Resultados de KNN vs DANN por acción
+
+Preparación
+
+```{r}
+if (SAVE_RESULTS && !dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR)
+}
+
+COLUMNAS_CONTROL <- c("id", "Fecha", "Clase")
+columnas_originales <- c("Var", "Último", "Apertura", "Máximo", "Mínimo", "Vol.")
+columnas_a_excluir <- unique(c(COLUMNAS_CONTROL, columnas_originales))
+predictors_final <- names(dataset)[!names(dataset) %in% columnas_a_excluir]
+
+acciones_validas <- dataset[, .N, by = id][N >= MIN_OBSERVACIONES]$id
+ACCIONES_A_MODELAR <- intersect(ACCIONES_A_MODELAR, acciones_validas)
+
+# Determinar si usar semillas
+n_semillas_efectivas <- ifelse(APLICAR_DOWNSAMPLING, N_SEMILLAS, 1)
+
+resultados_globales <- data.table()
+```
+
+La configuración para entrenar y testear es la siguiente:
+```{r echo=FALSE}
+cat("Acciones a modelar:", length(ACCIONES_A_MODELAR), "\n")
+cat("Mínimo de observaciones:", MIN_OBSERVACIONES, "\n")
+cat("Período train inicial:", as.character(FECHA_INICIO_TRAIN), "a", as.character(FECHA_FIN_TRAIN), "\n")
+cat("Test rolling: desde", as.character(FECHA_INICIO_TEST), "por", N_DIAS_TEST, "días\n")
+cat("Re-entrenar cada día:", ifelse(REENTRENAR_CADA_DIA, "SÍ", "NO"), "\n")
+cat("Downsampling:", ifelse(APLICAR_DOWNSAMPLING, "ACTIVADO", "DESACTIVADO"), "\n")
+cat("Semillas:", n_semillas_efectivas, ifelse(APLICAR_DOWNSAMPLING, "(con downsampling)", "(sin downsampling)"), "\n")
+cat("Métrica de optimización:", METRICA_OPTIMIZACION, "\n")
+cat("Walk-Forward: ventanas =", N_WINDOWS, ", meses mínimos =", MIN_TRAIN_MONTHS, "\n\n")
+```
+
+Iniciamos el procedimiento.
+```{r}
+for (accion in ACCIONES_A_MODELAR) {
+  
+  cat("\n", strrep("-", 80), "\n")
+  cat("PROCESANDO:", accion, "\n")
+  cat(strrep("-", 80), "\n\n")
+  
+  data_accion <- dataset[id == accion]
+  
+  fechas_disponibles <- data_accion[Fecha >= FECHA_INICIO_TEST]$Fecha
+  fechas_disponibles <- sort(unique(fechas_disponibles))
+  
+  if (length(fechas_disponibles) < N_DIAS_TEST) {
+    cat("Saltando: solo hay", length(fechas_disponibles), "fechas disponibles\n")
+    next
+  }
+  
+  fechas_test <- fechas_disponibles[1:N_DIAS_TEST]
+  
+  cat("Fechas test: desde", as.character(fechas_test[1]), 
+      "hasta", as.character(fechas_test[length(fechas_test)]), "\n")
+  
+  train_data_inicial <- data_accion[Fecha >= FECHA_INICIO_TRAIN & Fecha <= FECHA_FIN_TRAIN]
+  train_data_inicial <- train_data_inicial[order(Fecha)]
+  
+  if (nrow(train_data_inicial) < MIN_OBSERVACIONES) {
+    cat("Saltando: solo", nrow(train_data_inicial), "observaciones\n")
+    next
+  }
+  
+  cat("Train inicial:", nrow(train_data_inicial), "obs\n")
+  cat("Distribución clase train:", paste(table(train_data_inicial$Clase), collapse = " / "), "\n\n")
+  
+  train_data_inicial[, Clase := factor(Clase)]
+  
+  X_train_inicial <- as.matrix(train_data_inicial[, .SD, .SDcols = predictors_final])
+  y_train_inicial <- train_data_inicial$Clase
+  fechas_train_inicial <- train_data_inicial$Fecha
+  
+
+  # FASE 1: OPTIMIZACIÓN DE HIPERPARÁMETROS
+
+  cat("FASE 1: Optimizando hiperparámetros (", n_semillas_efectivas, " semilla", 
+      ifelse(n_semillas_efectivas > 1, "s", ""), ")...\n", sep = "")
+  
+  # Calcular índices para walk-forward
+  n_obs_inicial <- nrow(X_train_inicial)
+  n_dias_min_train <- MIN_TRAIN_MONTHS * 30.5
+  idx_min <- which(fechas_train_inicial >= (fechas_train_inicial[1] + n_dias_min_train))[1]
+  
+  if (is.na(idx_min) || idx_min > (n_obs_inicial - N_WINDOWS)) {
+    idx_min <- floor(n_obs_inicial * (1 - 1/N_WINDOWS))
+  }
+  idx_min <- max(idx_min, 1)
+  
+  if (idx_min >= n_obs_inicial) {
+    idx_min <- max(1, n_obs_inicial - N_WINDOWS)
+  }
+  
+  step_size <- floor((n_obs_inicial - idx_min) / N_WINDOWS)
+  
+  if (step_size < 1) {
+    N_WINDOWS <- 1
+    idx_min <- floor(n_obs_inicial * 0.8)
+    step_size <- n_obs_inicial - idx_min
+  }
+  
+  knn_results_all_seeds <- data.table()
+  dann_results_all_seeds <- data.table()
+  
+  for (seed_idx in 1:n_semillas_efectivas) {
+    seed_actual <- SEMILLAS[seed_idx]
+    set.seed(seed_actual)
+    
+    if (n_semillas_efectivas > 1) {
+      cat("  Semilla", seed_idx, "/", n_semillas_efectivas, "(", seed_actual, ")...\n")
+    }
+    
+    # k-NN
+    knn_results_seed <- data.table()
+    
+    for (k_val in K_VALUES) {
+      metricas <- numeric(N_WINDOWS)
+      
+      for (window in 1:N_WINDOWS) {
+        train_end <- idx_min + (window - 1) * step_size
+        val_start <- train_end + 1
+        val_end <- min(train_end + step_size, nrow(X_train_inicial))
+        
+        if (val_start > nrow(X_train_inicial)) break
+        
+        X_train_wf <- X_train_inicial[1:train_end, , drop = FALSE]
+        y_train_wf <- y_train_inicial[1:train_end]
+        X_val_wf <- X_train_inicial[val_start:val_end, , drop = FALSE]
+        y_val_wf <- y_train_inicial[val_start:val_end]
+        
+        # Aplicar downsampling si está activado
+        if (APLICAR_DOWNSAMPLING) {
+          train_balanced <- downSample(x = X_train_wf, y = y_train_wf, yname = "Clase")
+          setDT(train_balanced)
+          X_train_wf <- as.matrix(train_balanced[, !c("Clase"), with = FALSE])
+          y_train_wf <- train_balanced$Clase
+        }
+        
+        model_wf <- train(
+          x = X_train_wf,
+          y = y_train_wf,
+          method = "knn",
+          trControl = trainControl(method = "none"),
+          tuneGrid = data.frame(k = k_val)
+        )
+        
+        pred_wf <- predict(model_wf, newdata = X_val_wf)
+        pred_wf <- factor(pred_wf, levels = levels(y_train_inicial))
+        y_val_wf <- factor(y_val_wf, levels = levels(y_train_inicial))
+        
+        cm <- confusionMatrix(pred_wf, y_val_wf, positive = "1")
+        metricas[window] <- extraer_metrica(cm, METRICA_OPTIMIZACION)
+      }
+      
+      valid_metricas <- metricas[metricas > 0]
+      if (length(valid_metricas) > 0) {
+        knn_results_seed <- rbind(knn_results_seed, data.table(
+          semilla = seed_actual,
+          k = k_val,
+          metrica = mean(valid_metricas)
+        ))
+      }
+    }
+    
+    knn_results_all_seeds <- rbind(knn_results_all_seeds, knn_results_seed)
+    
+    # DANN
+    dann_results_seed <- data.table()
+    
+    for (k_val in K_VALUES[1:min(3, length(K_VALUES))]) {
+      for (eps_val in EPSILON_VALUES[1:min(2, length(EPSILON_VALUES))]) {
+        for (k_local_val in K_LOCAL_VALUES) {
+          metricas <- numeric(N_WINDOWS)
+          
+          for (window in 1:N_WINDOWS) {
+            train_end <- idx_min + (window - 1) * step_size
+            val_start <- train_end + 1
+            val_end <- min(train_end + step_size, nrow(X_train_inicial))
+            
+            if (val_start > nrow(X_train_inicial)) break
+            
+            X_train_wf <- X_train_inicial[1:train_end, , drop = FALSE]
+            y_train_wf <- y_train_inicial[1:train_end]
+            
+            # Aplicar downsampling si está activado
+            if (APLICAR_DOWNSAMPLING) {
+              train_balanced <- downSample(x = X_train_wf, y = y_train_wf, yname = "Clase")
+              setDT(train_balanced)
+              X_train_wf <- as.matrix(train_balanced[, !c("Clase"), with = FALSE])
+              y_train_wf <- train_balanced$Clase
+            }
+            
+            tryCatch({
+              dann_pred <- dann_classify(
+                X_train_wf, y_train_wf,
+                X_train_inicial[val_start:val_end, , drop = FALSE],
+                k = k_val, 
+                epsilon = eps_val,
+                k_local = k_local_val
+              )
+              
+              cm <- confusionMatrix(dann_pred$class, y_train_inicial[val_start:val_end], positive = "1")
+              metricas[window] <- extraer_metrica(cm, METRICA_OPTIMIZACION)
+            }, error = function(e) {
+              metricas[window] <<- 0
+            })
+          }
+          
+          valid_metricas <- metricas[metricas > 0]
+          if (length(valid_metricas) > 0) {
+            dann_results_seed <- rbind(dann_results_seed, data.table(
+              semilla = seed_actual,
+              k = k_val,
+              epsilon = eps_val,
+              k_local = k_local_val,
+              metrica = mean(valid_metricas)
+            ))
+          }
+        }
+      }
+    }
+    
+    dann_results_all_seeds <- rbind(dann_results_all_seeds, dann_results_seed)
+  }
+  
+  # Promediar resultados
+  if (nrow(knn_results_all_seeds) == 0) {
+    cat("⚠️  Saltando: no se pudieron calcular métricas k-NN\n")
+    next
+  }
+  
+  knn_results_avg <- knn_results_all_seeds[, .(metrica_avg = mean(metrica)), by = k]
+  best_k <- knn_results_avg[which.max(metrica_avg)]$k
+  best_k_metrica <- knn_results_avg[which.max(metrica_avg)]$metrica_avg
+  
+  cat("\n k-NN: Mejor k =", best_k, "|", METRICA_OPTIMIZACION, "=", round(best_k_metrica, 4), "\n")
+  
+  if (nrow(dann_results_all_seeds) > 0) {
+    dann_results_avg <- dann_results_all_seeds[
+      , .(metrica_avg = mean(metrica)),
+      by = .(k, epsilon, k_local)
+    ]
+    
+    best_dann <- dann_results_avg[which.max(metrica_avg)]
+    
+    best_dann_k <- best_dann$k
+    best_dann_eps <- best_dann$epsilon
+    best_dann_k_local <- best_dann$k_local
+    best_dann_metrica <- best_dann$metrica_avg
+  } else {
+    best_dann_k <- K_VALUES[1]
+    best_dann_eps <- EPSILON_VALUES[1]
+    best_dann_k_local <- K_LOCAL_VALUES[1]
+    best_dann_metrica <- 0
+  }
+  
+  cat(" DANN: Mejor k =", best_dann_k,
+      ", k_local =", best_dann_k_local,
+      ", ε =", best_dann_eps,
+      "|", METRICA_OPTIMIZACION, "=", round(best_dann_metrica, 4), "\n\n")
+
+  # FASE 2: ROLLING TEST
+  
+  cat("FASE 2: Rolling test por", N_DIAS_TEST, "días...\n")
+  
+  resultados_rolling <- data.table()
+  
+  for (i in 1:N_DIAS_TEST) {
+    fecha_test_actual <- fechas_test[i]
+    
+    if (REENTRENAR_CADA_DIA) {
+      fecha_fin_train_actual <- fecha_test_actual - 1
+      train_data_rolling <- data_accion[
+        Fecha >= FECHA_INICIO_TRAIN & Fecha <= fecha_fin_train_actual
+      ]
+    } else {
+      train_data_rolling <- train_data_inicial
+    }
+    
+    test_data_rolling <- data_accion[Fecha == fecha_test_actual]
+    
+    if (nrow(test_data_rolling) == 0) next
+    
+    train_data_rolling[, Clase := factor(Clase)]
+    test_data_rolling[, Clase := factor(Clase)]
+    
+    X_train_rolling <- as.matrix(train_data_rolling[, .SD, .SDcols = predictors_final])
+    y_train_rolling <- train_data_rolling$Clase
+    
+    X_test_rolling <- as.matrix(test_data_rolling[, .SD, .SDcols = predictors_final])
+    y_test_rolling <- test_data_rolling$Clase
+    
+    # Predecir (con o sin ensemble de semillas)
+    knn_preds_all_seeds <- character(n_semillas_efectivas)
+    dann_preds_all_seeds <- character(n_semillas_efectivas)
+    
+    for (seed_idx in 1:n_semillas_efectivas) {
+      if (APLICAR_DOWNSAMPLING) {
+        set.seed(SEMILLAS[seed_idx])
+        
+        # Aplicar downsampling
+        train_balanced <- downSample(x = X_train_rolling, y = y_train_rolling, yname = "Clase")
+        setDT(train_balanced)
+        X_train_use <- as.matrix(train_balanced[, !c("Clase"), with = FALSE])
+        y_train_use <- train_balanced$Clase
+      } else {
+        X_train_use <- X_train_rolling
+        y_train_use <- y_train_rolling
+      }
+      
+      # k-NN
+      knn_model_rolling <- train(
+        x = X_train_use,
+        y = y_train_use,
+        method = "knn",
+        trControl = trainControl(method = "none"),
+        tuneGrid = data.frame(k = best_k)
+      )
+      
+      knn_pred_rolling <- predict(knn_model_rolling, X_test_rolling)
+      knn_preds_all_seeds[seed_idx] <- as.character(knn_pred_rolling[1])
+      
+      # DANN
+      dann_pred_rolling <- tryCatch({
+        dann_classify(X_train_use, y_train_use, X_test_rolling, 
+              k = best_dann_k,
+              epsilon = best_dann_eps,
+              k_local = best_dann_k_local)
+      }, error = function(e) {
+        list(class = factor(NA, levels = levels(y_train_use)))
+      })
+      
+      dann_preds_all_seeds[seed_idx] <- as.character(dann_pred_rolling$class[1])
+    }
+    
+    # Votar por mayoría
+    knn_pred_final <- names(which.max(table(knn_preds_all_seeds)))
+    dann_pred_final <- names(which.max(table(dann_preds_all_seeds)))
+    
+    resultado_dia <- data.table(
+      Accion = accion,
+      Dia = i,
+      Fecha_Test = fecha_test_actual,
+      N_Train = nrow(train_data_rolling),
+      
+      Clase_Real = as.character(y_test_rolling[1]),
+      
+      kNN_Pred = knn_pred_final,
+      kNN_Acierto = (knn_pred_final == as.character(y_test_rolling[1])),
+      
+      DANN_Pred = dann_pred_final,
+      DANN_Acierto = (dann_pred_final == as.character(y_test_rolling[1]))
+    )
+    
+    resultados_rolling <- rbind(resultados_rolling, resultado_dia)
+    
+    if (i %% 10 == 0 || i == N_DIAS_TEST) {
+      cat("  Día", i, "/", N_DIAS_TEST, ":", as.character(fecha_test_actual),
+          "| kNN:", sum(resultados_rolling$kNN_Acierto, na.rm = TRUE), "/", i,
+          "| DANN:", sum(resultados_rolling$DANN_Acierto, na.rm = TRUE), "/", i, "\n")
+    }
+  }
+  
+  # Calcular TODAS las métricas en rolling test
+  knn_preds_total <- factor(resultados_rolling$kNN_Pred, levels = c("0", "1"))
+  dann_preds_total <- factor(resultados_rolling$DANN_Pred, levels = c("0", "1"))
+  y_real_total <- factor(resultados_rolling$Clase_Real, levels = c("0", "1"))
+  
+  cm_knn_total <- confusionMatrix(knn_preds_total, y_real_total, positive = "1")
+  cm_dann_total <- confusionMatrix(dann_preds_total, y_real_total, positive = "1")
+  
+  cat("\n Resultado rolling test:", accion, "\n")
+  cat("   k-NN:  Acc:", round(cm_knn_total$overall["Accuracy"]*100, 1), "%",
+      "| F1:", round(cm_knn_total$byClass["F1"], 3),
+      "| Recall:", round(cm_knn_total$byClass["Recall"], 3),
+      "| Prec:", round(cm_knn_total$byClass["Precision"], 3), "\n")
+  cat("   DANN:  Acc:", round(cm_dann_total$overall["Accuracy"]*100, 1), "%",
+      "| F1:", round(cm_dann_total$byClass["F1"], 3),
+      "| Recall:", round(cm_dann_total$byClass["Recall"], 3),
+      "| Prec:", round(cm_dann_total$byClass["Precision"], 3), "\n\n")
+  
+  resultado_accion <- data.table(
+    Accion = accion,
+    N_Train_Inicial = nrow(train_data_inicial),
+    N_Test_Total = nrow(resultados_rolling),
+    
+    kNN_k = best_k,
+    kNN_Accuracy = cm_knn_total$overall["Accuracy"],
+    kNN_F1 = cm_knn_total$byClass["F1"],
+    kNN_Recall = cm_knn_total$byClass["Recall"],
+    kNN_Precision = cm_knn_total$byClass["Precision"],
+    
+    DANN_k = best_dann_k,
+    DANN_k_local = best_dann_k_local,
+    DANN_epsilon = best_dann_eps,
+    DANN_Accuracy = cm_dann_total$overall["Accuracy"],
+    DANN_F1 = cm_dann_total$byClass["F1"],
+    DANN_Recall = cm_dann_total$byClass["Recall"],
+    DANN_Precision = cm_dann_total$byClass["Precision"]
+  )
+  
+  resultados_globales <- rbind(resultados_globales, resultado_accion)
+  
+  if (SAVE_RESULTS) {
+    fwrite(resultados_rolling, file.path(OUTPUT_DIR, paste0("rolling_", accion, ".csv")))
+  }
+}
+
+```
+
+Resumen final
+```{r}
+
+if (nrow(resultados_globales) > 0) {
+  
+  cat("Acciones procesadas:", nrow(resultados_globales), "\n")
+  cat("Métrica de optimización:", METRICA_OPTIMIZACION, "\n")
+  cat("Downsampling:", ifelse(APLICAR_DOWNSAMPLING, "ACTIVADO", "DESACTIVADO"), "\n\n")
+  
+  cat("MÉTRICAS PROMEDIO k-NN:\n")
+  cat(sprintf("  Accuracy:  %.2f%%\n", mean(resultados_globales$kNN_Accuracy, na.rm = TRUE) * 100))
+  cat(sprintf("  F1-score:  %.4f\n", mean(resultados_globales$kNN_F1, na.rm = TRUE)))
+  cat(sprintf("  Recall:    %.4f\n", mean(resultados_globales$kNN_Recall, na.rm = TRUE)))
+  cat(sprintf("  Precision: %.4f\n\n", mean(resultados_globales$kNN_Precision, na.rm = TRUE)))
+  
+  cat("MÉTRICAS PROMEDIO DANN:\n")
+  cat(sprintf("  Accuracy:  %.2f%%\n", mean(resultados_globales$DANN_Accuracy, na.rm = TRUE) * 100))
+  cat(sprintf("  F1-score:  %.4f\n", mean(resultados_globales$DANN_F1, na.rm = TRUE)))
+  cat(sprintf("  Recall:    %.4f\n", mean(resultados_globales$DANN_Recall, na.rm = TRUE)))
+  cat(sprintf("  Precision: %.4f\n\n", mean(resultados_globales$DANN_Precision, na.rm = TRUE)))
+  
+  cat("TOP 5 ACCIONES (ordenadas por", METRICA_OPTIMIZACION, "de DANN):\n")
+  col_ordenar <- paste0("DANN_", METRICA_OPTIMIZACION)
+  setorderv(resultados_globales, col_ordenar, order = -1)
+  
+  print(resultados_globales[1:min(5, .N), 
+    .(Accion, 
+      kNN_Acc = round(kNN_Accuracy * 100, 1),
+      kNN_F1 = round(kNN_F1, 3),
+      DANN_Acc = round(DANN_Accuracy * 100, 1),
+      DANN_F1 = round(DANN_F1, 3))])
+  
+  cat("COMPARACIÓN k-NN vs DANN:\n")
+  resultados_globales[, `:=`(
+    DANN_mejor_Acc = DANN_Accuracy > kNN_Accuracy,
+    DANN_mejor_F1 = DANN_F1 > kNN_F1,
+    Dif_Accuracy = (DANN_Accuracy - kNN_Accuracy) * 100,
+    Dif_F1 = DANN_F1 - kNN_F1
+  )]
+  
+  cat("Por Accuracy: DANN gana en", sum(resultados_globales$DANN_mejor_Acc, na.rm = TRUE), 
+      "de", nrow(resultados_globales), "acciones\n")
+  cat("Por F1-score: DANN gana en", sum(resultados_globales$DANN_mejor_F1, na.rm = TRUE), 
+      "de", nrow(resultados_globales), "acciones\n")
+  cat("Mejora promedio Accuracy:", round(mean(resultados_globales$Dif_Accuracy, na.rm = TRUE), 2), "p.p.\n")
+  cat("Mejora promedio F1:", round(mean(resultados_globales$Dif_F1, na.rm = TRUE), 4), "\n")
+  
+  if (SAVE_RESULTS) {
+    fwrite(resultados_globales, file.path(OUTPUT_DIR, "resultados_resumen_por_accion.csv"))
+  }
+  
+} else {
+  cat("No se procesaron acciones exitosamente\n")
+}
+```
+

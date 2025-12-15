@@ -1,0 +1,460 @@
+---
+title: "knn_vs_dann_wines"
+author: "Pablo Bianchi, Matías Calma"
+date: "2025-12-14"
+output: 
+  html_document:
+    theme: cosmo       
+    highlight: tango   
+    toc: true           
+    toc_float: true    
+---
+
+```{r include=FALSE}
+library(data.table)
+library(caret)
+library(dplyr)
+library(ggplot2)
+```
+
+# Comparación de kNN y DANN en el dataset de Wines
+
+## Carga del dataset
+
+```{r}
+# URLs del dataset
+url_red <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv"
+url_white <- "https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-white.csv"
+
+# Descargar y cargar
+red_wine <- fread(url_red, sep = ";")
+white_wine <- fread(url_white, sep = ";")
+  
+# Agregar columna de tipo
+red_wine[, type := "red"]
+white_wine[, type := "white"]
+  
+# Combinar datasets
+wine <- rbind(red_wine, white_wine)
+```
+
+## Dataset
+
+Visualizamos el dataset.
+
+```{r}
+wine
+```
+
+Información básica del dataset.
+
+```{r echo=FALSE}
+cat("Total de vinos:", nrow(wine), "\n")
+cat("Features:", ncol(wine) - 2)
+```
+
+Features disponibles:
+
+```{r echo=FALSE}
+feature_names <- setdiff(names(wine), c("quality", "type"))
+for (i in seq_along(feature_names)) {
+  cat(sprintf("  %2d. %s\n", i, feature_names[i]))
+}
+```
+
+## Creamos la clase
+
+Definimos la variable objetivo.
+
+```{r}
+
+# Crear variable binaria: Bueno (>=6) vs Malo (<6)
+wine[, quality_binary := factor(ifelse(quality >= 6, "Bueno", "Malo"))]
+```
+
+```{r echo=FALSE}
+print(table(wine$quality_binary))
+cat("Proporción de vinos buenos:", 
+    round(mean(wine$quality_binary == "Bueno") * 100, 1), "%\n\n")
+```
+
+## Preparamos los datos para el modelo
+
+Partimos los datos en train y test.
+
+```{r}
+# Preparar datos
+X <- as.matrix(wine[, .SD, .SDcols = feature_names])
+y <- wine$quality_binary
+
+# Split train/test estratificado
+set.seed(42)
+train <- createDataPartition(y, p = 0.7, list = FALSE)
+
+X_train <- X[train, ]
+y_train <- y[train]
+X_test <- X[-train, ]
+y_test <- y[-train]
+```
+
+```{r echo=FALSE}
+cat("Train set:", nrow(X_train), "observaciones\n")
+cat("Test set:", nrow(X_test), "observaciones\n")
+cat("Distribución en train:", 
+    paste(table(y_train), collapse = " / "), "\n\n")
+```
+
+## Funciones necesarias para DANN
+
+```{r}
+compute_between_scatter <- function(X, y) {
+  classes <- unique(y)
+  n <- nrow(X)
+  p <- ncol(X)
+  overall_mean <- colMeans(X)
+  
+  B <- matrix(0, p, p)
+  for (class in classes) {
+    X_class <- X[y == class, , drop = FALSE]
+    n_class <- nrow(X_class)
+    class_mean <- colMeans(X_class)
+    diff <- class_mean - overall_mean
+    B <- B + (n_class / n) * outer(diff, diff)
+  }
+  return(B)
+}
+
+compute_within_scatter <- function(X, y) {
+  classes <- unique(y)
+  n <- nrow(X)
+  p <- ncol(X)
+  
+  W <- matrix(0, p, p)
+  for (class in classes) {
+    X_class <- X[y == class, , drop = FALSE]
+    n_class <- nrow(X_class)
+    class_mean <- colMeans(X_class)
+    
+    for (i in 1:n_class) {
+      diff <- X_class[i, ] - class_mean
+      W <- W + (1 / n) * outer(diff, diff)
+    }
+  }
+  return(W)
+}
+
+dann_classify <- function(X_train, y_train, X_test, k = 5, epsilon = 1, 
+                          k_local = 50, verbose = FALSE) {
+  n_train <- nrow(X_train)
+  n_test <- nrow(X_test)
+  p <- ncol(X_train)
+  
+  if (verbose) cat("DANN clasificando", n_test, "observaciones...\n")
+  
+  # Normalizar
+  means <- colMeans(X_train)
+  sds <- apply(X_train, 2, sd)
+  sds[sds == 0] <- 1
+  
+  X_train_scaled <- scale(X_train, center = means, scale = sds)
+  X_test_scaled <- scale(X_test, center = means, scale = sds)
+  
+  if (verbose) cat("Calculando matrices de dispersión globales...\n")
+  
+  # Matrices globales
+  B <- compute_between_scatter(X_train_scaled, y_train)
+  W <- compute_within_scatter(X_train_scaled, y_train)
+  W_reg <- W + epsilon * diag(p)
+  
+  W_inv <- tryCatch({
+    solve(W_reg)
+  }, error = function(e) {
+    diag(1, p)
+  })
+  
+  predictions <- vector("character", n_test)
+  probabilities <- matrix(0, n_test, length(unique(y_train)))
+  colnames(probabilities) <- sort(unique(y_train))
+  
+  if (verbose) cat("Clasificando con métrica adaptativa local...\n")
+  
+  for (i in 1:n_test) {
+    x_test <- X_test_scaled[i, ]
+    
+    # Vecinos cercanos
+    distances_euclidean <- sqrt(rowSums((sweep(X_train_scaled, 2, x_test))^2))
+    k_local_used <- min(k_local, n_train)
+    k_nearest_idx <- order(distances_euclidean)[1:k_local_used]
+    
+    # Matrices locales
+    X_local <- X_train_scaled[k_nearest_idx, , drop = FALSE]
+    y_local <- y_train[k_nearest_idx]
+    
+    if (length(unique(y_local)) > 1 && k_local_used > p) {
+      W_local <- compute_within_scatter(X_local, y_local)
+      W_local_reg <- W_local + epsilon * diag(p)
+      
+      metric_matrix <- tryCatch({
+        solve(W_local_reg) + epsilon * B
+      }, error = function(e) {
+        W_inv + epsilon * B
+      })
+    } else {
+      metric_matrix <- W_inv + epsilon * B
+    }
+    
+    # Distancias adaptadas
+    distances_adapted <- numeric(k_local_used)
+    for (j in 1:k_local_used) {
+      diff <- X_train_scaled[k_nearest_idx[j], ] - x_test
+      distances_adapted[j] <- tryCatch({
+        sqrt(max(0, as.numeric(t(diff) %*% metric_matrix %*% diff)))
+      }, error = function(e) {
+        distances_euclidean[k_nearest_idx[j]]
+      })
+    }
+    
+    # K vecinos finales
+    final_k_idx <- k_nearest_idx[order(distances_adapted)[1:min(k, k_local_used)]]
+    k_neighbors_classes <- y_train[final_k_idx]
+    
+    # Votar
+    vote_table <- table(k_neighbors_classes)
+    predictions[i] <- names(which.max(vote_table))
+    
+    for (class in names(vote_table)) {
+      probabilities[i, class] <- vote_table[class] / length(k_neighbors_classes)
+    }
+    
+    if (verbose && i %% 500 == 0) {
+      cat("     Progreso:", i, "/", n_test, "\n")
+    }
+  }
+  
+  if (verbose) cat("Clasificación completa\n\n")
+  
+  return(list(
+    class = factor(predictions, levels = levels(y_train)),
+    prob = probabilities
+  ))
+}
+```
+
+## Optimización del K
+
+```{r}
+# Grid de valores posibles
+k_values <- c(5, 7, 9, 11, 15)
+epsilon_values <- c(0.001, 0.1, 0.25, 0.5, 1.0)
+k_local_values <- c(10, 50, 100, 200, 300)
+```
+
+### Optimización del KNN
+
+```{r}
+set.seed(42)
+nfolds <- 5
+folds <- createFolds(y_train, k = nfolds, list = TRUE)
+
+knn_cv_results <- data.table()
+
+for (k_val in k_values) {
+  f1_scores <- numeric(nfolds)
+  
+  for (fold in 1:nfolds) {
+    val_idx <- folds[[fold]]
+    train_cv_idx <- setdiff(1:nrow(X_train), val_idx)
+    
+    model <- train(
+      x = X_train[train_cv_idx, ],
+      y = y_train[train_cv_idx],
+      method = "knn",
+      trControl = trainControl(method = "none"),
+      tuneGrid = data.frame(k = k_val)
+    )
+    
+    pred <- predict(model, X_train[val_idx, ])
+    pred <- factor(pred, levels = levels(y_train))
+    y_val <- factor(y_train[val_idx], levels = levels(y_train))
+    
+    cm <- confusionMatrix(pred, y_val, positive = "Bueno")
+    f1_scores[fold] <- cm$byClass["F1"]
+    if (is.na(f1_scores[fold])) f1_scores[fold] <- 0
+  }
+  
+  knn_cv_results <- rbind(knn_cv_results, data.table(
+    k = k_val,
+    mean_f1 = mean(f1_scores),
+    sd_f1 = sd(f1_scores)
+  ))
+  
+  cat(sprintf("  k = %2d -> F1: %.4f (±%.4f)\n", 
+              k_val, mean(f1_scores), sd(f1_scores)))
+}
+
+best_k <- knn_cv_results[which.max(mean_f1)]$k
+cat("Mejor k para k-NN:", best_k, 
+    "| F1:", round(knn_cv_results[which.max(mean_f1)]$mean_f1, 4), "\n\n")
+
+```
+
+### Optimización de DANN
+
+```{r message=FALSE, warning=FALSE}
+dann_cv_results <- data.table()
+
+for (k_val in k_values) {
+  for (eps_val in epsilon_values) {
+    for (k_local_val in k_local_values) {  
+      f1_scores <- numeric(nfolds)
+
+      for (fold in 1:nfolds) {
+        val_idx <- folds[[fold]]
+        train_cv_idx <- setdiff(1:nrow(X_train), val_idx)
+
+               dann_pred <- dann_classify(
+          X_train[train_cv_idx, ],
+          y_train[train_cv_idx],
+          X_train[val_idx, ],
+          k = k_val,
+          epsilon = eps_val,
+          k_local = k_local_val 
+        )
+
+        dann_pred_class <- factor(dann_pred$class, levels = levels(y_train))
+        y_val <- factor(y_train[val_idx], levels = levels(y_train))
+
+        cm <- confusionMatrix(dann_pred_class, y_val, positive = "Bueno")
+        f1_scores[fold] <- cm$byClass["F1"]
+        if (is.na(f1_scores[fold])) f1_scores[fold] <- 0
+      }
+
+      dann_cv_results <- rbind(dann_cv_results, data.table(
+        k = k_val,
+        epsilon = eps_val,
+        k_local = k_local_val, 
+        mean_f1 = mean(f1_scores),
+        sd_f1 = sd(f1_scores)
+      ))
+
+      cat(sprintf("  k = %2d, ε = %.1f, k_local = %2d -> F1: %.4f (±%.4f)\n",
+                  k_val, eps_val, k_local_val, mean(f1_scores), sd(f1_scores)))
+    }
+  }
+}
+
+best_dann <- dann_cv_results[which.max(mean_f1)]
+cat("Mejor configuración DANN: k =", best_dann$k,
+    ", epsilon =", best_dann$epsilon,
+    ", k_local =", best_dann$k_local,
+    "| F1:", round(best_dann$mean_f1, 4), "\n\n")
+
+```
+
+## Evaluación en Test
+
+### k-NN
+
+```{r echo=FALSE}
+cat("Evaluando k-NN con k =", best_k, "...\n")
+```
+
+```{r}
+knn_model <- train(
+  x = X_train,
+  y = y_train,
+  method = "knn",
+  trControl = trainControl(method = "none"),
+  tuneGrid = data.frame(k = best_k)
+)
+
+knn_pred <- predict(knn_model, X_test)
+knn_pred <- factor(knn_pred, levels = levels(y_train))
+y_test_factor <- factor(y_test, levels = levels(y_train))
+
+cm_knn <- confusionMatrix(knn_pred, y_test_factor, positive = "Bueno")
+
+```
+
+**Resultados de k-NN**
+
+Matriz de confusión:
+
+```{r echo=FALSE}
+print(cm_knn$table)
+```
+
+Métricas de k-NN:
+
+```{r echo=FALSE, paged.print=FALSE}
+cat(sprintf("  Accuracy:  %.2f%%\n", cm_knn$overall["Accuracy"] * 100))
+cat(sprintf("  F1-score:  %.2f%%\n", cm_knn$byClass["F1"] * 100))
+cat(sprintf("  Precision: %.2f%%\n", cm_knn$byClass["Precision"] * 100))
+cat(sprintf("  Recall:    %.2f%%\n", cm_knn$byClass["Recall"] * 100))
+cat(sprintf("  Specificity: %.2f%%\n", cm_knn$byClass["Specificity"] * 100))
+```
+
+### DANN
+
+```{r echo=FALSE}
+cat("Evaluando DANN con k =", best_dann$k, ", epsilon =", best_dann$epsilon, ", k_local =", best_dann$k_local, "...\n")
+```
+
+```{r}
+dann_pred <- dann_classify(X_train, y_train, X_test, 
+                           k = best_dann$k, 
+                           epsilon = best_dann$epsilon,
+                           verbose = TRUE)
+
+dann_pred_class <- factor(dann_pred$class, levels = levels(y_train))
+cm_dann <- confusionMatrix(dann_pred_class, y_test_factor, positive = "Bueno")
+
+```
+
+**Resultados de DANN**
+
+Matriz de confusión:
+
+```{r echo=FALSE}
+print(cm_dann$table)
+```
+
+Métricas:
+
+```{r echo=FALSE}
+cat(sprintf("  Accuracy:  %.2f%%\n", cm_dann$overall["Accuracy"] * 100))
+cat(sprintf("  F1-score:  %.2f%%\n", cm_dann$byClass["F1"] * 100))
+cat(sprintf("  Precision: %.2f%%\n", cm_dann$byClass["Precision"] * 100))
+cat(sprintf("  Recall:    %.2f%%\n", cm_dann$byClass["Recall"] * 100))
+cat(sprintf("  Specificity: %.2f%%\n", cm_dann$byClass["Specificity"] * 100))
+```
+
+## Resultados y conclusiones
+
+```{r echo=FALSE}
+
+comparacion <- data.table(
+  Métrica = c("Accuracy (%)", "F1-score", "Precision", "Recall", "Specificity"),
+  kNN = c(
+    round(cm_knn$overall["Accuracy"] * 100, 2),
+    round(cm_knn$byClass["F1"]* 100, 2),
+    round(cm_knn$byClass["Precision"]* 100, 2),
+    round(cm_knn$byClass["Recall"] *100, 2),
+    round(cm_knn$byClass["Specificity"]* 100, 2)
+  ),
+  DANN = c(
+    round(cm_dann$overall["Accuracy"] * 100, 2),
+    round(cm_dann$byClass["F1"] * 100, 2),
+    round(cm_dann$byClass["Precision"] * 100, 2),
+    round(cm_dann$byClass["Recall"] * 100, 2),
+    round(cm_dann$byClass["Specificity"] * 100, 2)
+  )
+)
+
+comparacion[, Diferencia := DANN - kNN]
+comparacion[, Ganador := ifelse(Diferencia > 0, "DANN", 
+                                ifelse(Diferencia < 0, "k-NN", "Empate"))]
+
+print(comparacion)
+
+```
