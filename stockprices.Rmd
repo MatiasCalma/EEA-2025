@@ -21,21 +21,21 @@ library(lubridate)
 ## Cargamos los datasets
 
 ```{r}
-galicia <- fread("dataset/Datos históricos de GP Fin Galicia (GGALm) 01-19 a 06-25.csv")
-ypf <- fread("dataset/Datos históricos de YPF (YPFDm).csv")
-pampa <- fread("dataset/Datos históricos de Pampa Energía (PAMPm).csv")
-agrometal <- fread("dataset/Datos históricos de Agrometal (AGROm).csv")
-morixe <- fread("dataset/Datos históricos de Morixe Hermanos (MORIm).csv")
-ternium <- fread("dataset/Datos históricos de Ternium Argentina (TXARm).csv")
-loma <- fread("dataset/Datos históricos de Loma Negra (LOMAm).csv")
-aluar <- fread("dataset/Datos históricos de Aluar (ALUAm).csv")
-byma <- fread("dataset/Datos históricos de BYMA (BYMAm).csv")
-cepu <- fread("dataset/Datos históricos de Central Puerto (CEPUm).csv")
-come <- fread("dataset/Datos históricos de Comercial del Plata (COMEm).csv")
-supv <- fread("dataset/Datos históricos de Grupo Supervielle (SUPVm).csv")
-irsa <- fread("dataset/Datos históricos de IRSA (IRSAm).csv")
-tran <- fread("dataset/Datos históricos de Transener (TRANm).csv")
-tgno <- fread("dataset/Datos históricos de Trans. Gas Norte (TGNO4m).csv")
+galicia <- fread("dataset/Datos históricos de GP Fin Galicia (GGALm) 01-19 a 06-25.csv") #https://es.investing.com/equities/gp-fin-galicia-historical-data
+ypf <- fread("dataset/Datos históricos de YPF (YPFDm).csv") #https://es.investing.com/equities/ypf-sociedad-historical-data
+pampa <- fread("dataset/Datos históricos de Pampa Energía (PAMPm).csv") #https://es.investing.com/equities/pampa-energia-historical-data
+agrometal <- fread("dataset/Datos históricos de Agrometal (AGROm).csv") #https://es.investing.com/equities/agrometal-historical-data
+morixe <- fread("dataset/Datos históricos de Morixe Hermanos (MORIm).csv") #https://es.investing.com/equities/morixe-historical-data
+ternium <- fread("dataset/Datos históricos de Ternium Argentina (TXARm).csv") #https://es.investing.com/equities/siderar-historical-data
+loma <- fread("dataset/Datos históricos de Loma Negra (LOMAm).csv") #https://es.investing.com/equities/loma-negra-ba-historical-data
+aluar <- fread("dataset/Datos históricos de Aluar (ALUAm).csv") #https://es.investing.com/equities/aluar-historical-data
+byma <- fread("dataset/Datos históricos de BYMA (BYMAm).csv") #https://es.investing.com/equities/bolsas-y-mercados-argentinos-sa-historical-data
+cepu <- fread("dataset/Datos históricos de Central Puerto (CEPUm).csv") #https://es.investing.com/equities/central-puerto-historical-data
+come <- fread("dataset/Datos históricos de Comercial del Plata (COMEm).csv") #https://es.investing.com/equities/comer-del-plat-historical-data
+supv <- fread("dataset/Datos históricos de Grupo Supervielle (SUPVm).csv") #https://es.investing.com/equities/grupo-supervielle-sa-historical-data
+irsa <- fread("dataset/Datos históricos de IRSA (IRSAm).csv") #https://es.investing.com/equities/irsa-historical-data
+tran <- fread("dataset/Datos históricos de Transener (TRANm).csv") #https://es.investing.com/equities/transener
+tgno <- fread("dataset/Datos históricos de Trans. Gas Norte (TGNO4m).csv") #https://es.investing.com/equities/tran-gas-norte-historical-data
 ```
 
 ```{r}
@@ -149,7 +149,7 @@ dataset[, "Vol." := NULL]
 
 
 ```{r}
-uva <- fread("dataset/cotizacionesUVA.csv")
+uva <- fread("dataset/cotizacionesUVA.csv") #https://www.bcra.gob.ar/PublicacionesEstadisticas/Principales_variables_datos.asp
 uva[, Fecha := as.Date(fecha, format = "%d/%m/%Y")]
 setcolorder(uva, c("fecha","Fecha")) ## poner las dos primeras columnas
 
