@@ -19,9 +19,9 @@ library(data.table)
 #ruta <- "/content/drive/MyDrive/EEA/dataset"
 ruta <-'G:/.shortcut-targets-by-id/1kW9PMD29uXKTfSNf1uj6E11vsnWOAD72/EEA/dataset'
 
-galicia <- fread(paste0(ruta, "/Datos históricos de GP Fin Galicia (GGALm) 01-19 a 06-25.csv"))
-ypf     <- fread(paste0(ruta, "/Datos históricos de YPF (YPFDm).csv"))
-pampa  <- fread(paste0(ruta, "/Datos históricos de Pampa Energía (PAMPm).csv"))
+galicia <- fread(paste0(ruta, "/Datos históricos de GP Fin Galicia (GGALm) 01-19 a 06-25.csv")) #https://es.investing.com/equities/gp-fin-galicia-historical-data
+ypf     <- fread(paste0(ruta, "/Datos históricos de YPF (YPFDm).csv")) #https://es.investing.com/equities/ypf-sociedad-historical-data
+pampa  <- fread(paste0(ruta, "/Datos históricos de Pampa Energía (PAMPm).csv")) #https://es.investing.com/equities/pampa-energia-historical-data
 
 ```
 
@@ -472,7 +472,7 @@ for (k_val in ks) {
 
 ```{r}
 Sys.time()
-fwrite(resultados, paste0(ruta, '/resultados_variacion_0',accion,'_2023a2024_1422025.csv'))
+#fwrite(resultados, paste0(ruta, '/resultados_variacion_0',accion,'_2023a2024_1422025.csv'))
 ```
 
 ## Curvas de complejidad
@@ -536,4 +536,5 @@ ggplot(result_long, aes(y=Valor, x=k, color=Metrica))+
   facet_grid(accion~epsilon)+
   scale_x_continuous(breaks = seq(0, 150, by = 25))
 ```
+
 
